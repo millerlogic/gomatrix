@@ -1,23 +1,23 @@
-package main
+package gomatrix
 
 import (
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"sync"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gdamore/tcell"
-	"github.com/jessevdk/go-flags"
 )
 
 var screen tcell.Screen
 
-// command line flags variable
-var opts struct {
+// Opts are options for Run
+type Opts struct {
 	// display ascii only instead of ascii+kana's
 	Ascii bool `short:"a" long:"ascii" description:"Use ascii/alphanumeric characters only instead of a mixture with japanese kana's."`
 
@@ -59,14 +59,10 @@ var allTheCharacters = append(halfWidthKana, alphaNumerics...)
 // defaults to allTheCharacters
 var characters []rune
 
-// streamDisplays by column number
-var streamDisplaysByColumn = make(map[int]*StreamDisplay)
+var gLock sync.RWMutex
 
 // current sizes
-var curSizes sizes
-
-// channel used to notify StreamDisplayManager
-var sizesUpdateCh = make(chan sizes)
+var curSizes sizes // locked by gLock
 
 // struct sizes contains terminal sizes (in amount of characters)
 type sizes struct {
@@ -82,45 +78,17 @@ func (s *sizes) setSizes(width int, height int) {
 	s.curStreamsPerStreamDisplay = 1 + height/10
 }
 
-func main() {
-	// parse flags
-	args, err := flags.Parse(&opts)
-	if err != nil {
-		flagError := err.(*flags.Error)
-		if flagError.Type == flags.ErrHelp {
-			return
-		}
-		if flagError.Type == flags.ErrUnknownFlag {
-			fmt.Println("Use --help to view all available options.")
-			return
-		}
-		fmt.Printf("Error parsing flags: %s\n", err)
-		return
+// Run the digital rain!
+// The screen is optional, set to nil to use default.
+// Note: only one can be run at a time, it uses global state.
+func Run(opts Opts, useScreen tcell.Screen, output io.Writer) int {
+	if screen != nil { // global screen already set?
+		fmt.Fprintln(output, "Already running")
+		return 1
 	}
-	if len(args) > 0 {
-		// we don't accept too much arguments..
-		fmt.Printf("Unknown argument '%s'.\n", args[0])
-		return
-	}
-	if opts.FPS < 1 || opts.FPS > 60 {
-		fmt.Println("Error: option --fps not within range 1-60")
-		os.Exit(1)
-	}
-	// Start profiling (if required)
-	if len(opts.Profile) > 0 {
-		f, err := os.Create(opts.Profile)
-		if err != nil {
-			fmt.Printf("Error opening profiling file: %s\n", err)
-			os.Exit(1)
-		}
-		err = pprof.StartCPUProfile(f)
-		if err != nil {
-			fmt.Printf("Error start profiling : %s\n", err)
-			os.Exit(1)
-		}
-	}
-	// Use a println for fun..
-	fmt.Println("Opening connection to The Matrix.. Please stand by..")
+	screen = useScreen
+	defer func() { screen = nil }()
+
 	// setup logging with logfile /dev/null or ~/.gomatrix-log
 	filename := os.DevNull
 	if opts.Logging {
@@ -128,11 +96,50 @@ func main() {
 	}
 	logfile, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		fmt.Printf("Could not open logfile. %s\n", err)
-		os.Exit(1)
+		fmt.Fprintf(output, "Could not open logfile. %s\n", err)
+		return 1
 	}
 	defer logfile.Close()
+	oldLogOutput := log.Writer()
 	log.SetOutput(logfile)
+	defer log.SetOutput(oldLogOutput) // restore
+
+	waitg := &sync.WaitGroup{}
+	ret := run(opts, output, waitg)
+
+	fmt.Fprintln(output, "Thank you for connecting with Morpheus' Matrix API v4.2. Have a nice day!")
+
+	waitg.Wait()
+
+	return ret
+}
+
+func run(opts Opts, output io.Writer, waitg *sync.WaitGroup) int {
+	if opts.FPS < 1 || opts.FPS > 60 {
+		fmt.Fprintln(output, "Error: option --fps not within range 1-60")
+		return 1
+	}
+	// Start profiling (if required)
+	if len(opts.Profile) > 0 {
+		f, err := os.Create(opts.Profile)
+		if err != nil {
+			fmt.Fprintf(output, "Error opening profiling file: %s\n", err)
+			return 1
+		}
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			fmt.Fprintf(output, "Error start profiling : %s\n", err)
+			return 1
+		}
+		defer func() {
+			// stop profiling (if required)
+			if len(opts.Profile) > 0 {
+				pprof.StopCPUProfile()
+			}
+		}()
+	}
+	// Use a println for fun..
+	fmt.Fprintln(output, "Opening connection to The Matrix.. Please stand by..")
 	log.Println("-------------")
 	log.Println("Starting gomatrix. This logfile is for development/debug purposes.")
 	if opts.Ascii {
@@ -142,30 +149,49 @@ func main() {
 	} else {
 		characters = allTheCharacters
 	}
-	// seed the rand package with time
-	rand.Seed(time.Now().UnixNano())
 
-	// initialize tcell
-	if screen, err = tcell.NewScreen(); err != nil {
-		fmt.Println("Could not start tcell for gomatrix. View ~/.gomatrix-log for error messages.")
-		log.Printf("Cannot alloc screen, tcell.NewScreen() gave an error:\n%s", err)
-		os.Exit(1)
+	if screen == nil {
+		// initialize tcell
+		var err error
+		if screen, err = tcell.NewScreen(); err != nil {
+			fmt.Fprintln(output, "Could not start tcell for gomatrix. View ~/.gomatrix-log for error messages.")
+			log.Printf("Cannot alloc screen, tcell.NewScreen() gave an error:\n%s", err)
+			return 1
+		}
+
+		err = screen.Init()
+		if err != nil {
+			fmt.Fprintln(output, "Could not start tcell for gomatrix. View ~/.gomatrix-log for error messages.")
+			log.Printf("Cannot start gomatrix, Screen.Init() gave an error:\n%s", err)
+			return 1
+		}
+
+		defer func() {
+			// close down
+			screen.Fini()
+		}()
 	}
 
-	err = screen.Init()
-	if err != nil {
-		fmt.Println("Could not start tcell for gomatrix. View ~/.gomatrix-log for error messages.")
-		log.Printf("Cannot start gomatrix, screen.Init() gave an error:\n%s", err)
-		os.Exit(1)
-	}
 	screen.HideCursor()
 	screen.SetStyle(tcell.StyleDefault.
 		Background(tcell.ColorBlack).
 		Foreground(tcell.ColorBlack))
 	screen.Clear()
 
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	// channel used to notify StreamDisplayManager
+	var sizesUpdateCh = make(chan sizes)
+	defer close(sizesUpdateCh)
+
+	// streamDisplays by column number
+	var streamDisplaysByColumn = make(map[int]*StreamDisplay)
+
 	// StreamDisplay manager
+	waitg.Add(1)
 	go func() {
+		defer waitg.Done()
 		var lastWidth int
 
 		for newSizes := range sizesUpdateCh {
@@ -184,14 +210,18 @@ func main() {
 					// create stream display
 					sd := &StreamDisplay{
 						column:    newColumn,
-						stopCh:    make(chan bool, 1),
+						stopCh:    make(chan struct{}),
 						streams:   make(map[*Stream]bool),
 						newStream: make(chan bool, 1), // will only be filled at start and when a spawning stream has it's tail released
 					}
 					streamDisplaysByColumn[newColumn] = sd
 
 					// start StreamDisplay in goroutine
-					go sd.run()
+					waitg.Add(1)
+					go func() {
+						defer waitg.Done()
+						sd.run()
+					}()
 
 					// create first new stream
 					sd.newStream <- true
@@ -209,40 +239,70 @@ func main() {
 					delete(streamDisplaysByColumn, closeColumn)
 
 					// inform sd that it's being closed
-					sd.stopCh <- true
+					close(sd.stopCh)
 				}
 				lastWidth = newSizes.width
 			}
 		}
+
+		// Cleanup all streams:
+		log.Printf("Closing %d SD's\n", lastWidth)
+		for closeColumn := 0; closeColumn < lastWidth; closeColumn++ {
+			// get sd
+			sd := streamDisplaysByColumn[closeColumn]
+
+			// delete from map
+			delete(streamDisplaysByColumn, closeColumn)
+
+			// inform sd that it's being closed
+			close(sd.stopCh)
+		}
+
 	}()
 
 	// set initial sizes
+	gLock.Lock()
 	curSizes.setSizes(screen.Size())
+	gLock.Unlock()
 	sizesUpdateCh <- curSizes
 
 	// flusher flushes the termbox every x milliseconds
 	curFPS := opts.FPS
 	fpsSleepTime := time.Duration(1000000/curFPS) * time.Microsecond
-	fmt.Printf("fps sleep time: %s\n", fpsSleepTime.String())
+	fmt.Fprintf(output, "fps sleep time: %s\n", fpsSleepTime.String())
+	waitg.Add(1)
 	go func() {
+		defer waitg.Done()
 		for {
 			time.Sleep(fpsSleepTime)
-			screen.Show()
+			select {
+			case <-stopCh:
+				return
+			default:
+				screen.Show()
+			}
 		}
 	}()
 
 	// make chan for tembox events and run poller to send events on chan
 	eventChan := make(chan tcell.Event)
+	waitg.Add(1)
 	go func() {
+		defer waitg.Done()
 		for {
 			event := screen.PollEvent()
+			if event == nil {
+				break
+			}
 			eventChan <- event
 		}
+		close(eventChan)
 	}()
 
 	// register signals to channel
 	sigChan := make(chan os.Signal)
 	signal.Notify(sigChan, os.Interrupt, os.Kill)
+	defer signal.Stop(sigChan)
 
 	// handle tcell events and unix signals
 EVENTS:
@@ -250,6 +310,9 @@ EVENTS:
 		// select for either event or signal
 		select {
 		case event := <-eventChan:
+			if event == nil {
+				break
+			}
 			log.Printf("Have event: \n%s", spew.Sdump(event))
 			// switch on event type
 			switch ev := event.(type) {
@@ -296,10 +359,12 @@ EVENTS:
 				}
 			case *tcell.EventResize: // set sizes
 				w, h := ev.Size()
+				gLock.Lock()
 				curSizes.setSizes(w, h)
+				gLock.Unlock()
 				sizesUpdateCh <- curSizes
 			case *tcell.EventError: // quit
-				log.Fatalf("Quitting because of tcell error: %v", ev.Error())
+				log.Panicf("Quitting because of tcell error: %v", ev.Error())
 			}
 
 		case signal := <-sigChan:
@@ -308,14 +373,7 @@ EVENTS:
 		}
 	}
 
-	// close down
-	screen.Fini()
-
 	log.Println("stopping gomatrix")
-	fmt.Println("Thank you for connecting with Morpheus' Matrix API v4.2. Have a nice day!")
 
-	// stop profiling (if required)
-	if len(opts.Profile) > 0 {
-		pprof.StopCPUProfile()
-	}
+	return 0
 }
